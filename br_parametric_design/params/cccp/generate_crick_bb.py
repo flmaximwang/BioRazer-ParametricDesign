@@ -3,7 +3,7 @@ Generate coiled-coil backbone from Crick parameters.
 """
 
 import numpy as np
-from ...geometry import crick_eq, absolute_to_register_zoff, absolute_to_zoff_aa
+from .geometry import crick_eq, absolute_to_register_zoff, absolute_to_zoff_aa
 
 
 def generate_crick_bb(

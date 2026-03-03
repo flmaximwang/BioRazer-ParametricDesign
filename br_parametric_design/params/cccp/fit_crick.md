@@ -1,0 +1,4 @@
+- `_M`: CA coordinates, np.ndarray, `n*3`
+- `_determine_chain_properties`: Given the flattened CA coordinates, return 
+  - `co`: chain_order, for unsorted helices.
+  - `cr`: chain_orientation, np.ndarray, 1 for parallel and 0 for anti-parallel.

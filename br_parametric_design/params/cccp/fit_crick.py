@@ -5,8 +5,8 @@ Fit Crick parameters to input structure.
 import numpy as np
 from scipy.optimize import minimize, least_squares
 import warnings
-from ...geometry import crick_eq, superimpose, crossing_angle
-from ...math import angle_pmp, get_heptad_position, canonical_phases
+from .geometry import crick_eq, superimpose, crossing_angle
+from .math import angle_pmp, get_heptad_position, canonical_phases
 from .read_ca import read_ca
 from .generate_crick_bb import generate_crick_bb_rad
 

@@ -1,25 +1,90 @@
 import numpy as np
-from .generator import generate_helix_ca_by_crick, generate_cc_ca_by_crick
+from .generate import generate_helix_ca_by_crick, generate_cc_ca_by_cccp
 from scipy.optimize import least_squares
 
 
-def _fit_helix_by_crick_residuals(params, ca_coords_observed, N):
-    centroid = params[:3]
-    direction = params[3:6]
-    radius = params[6]
-    omega = params[7]
-    pitch_angle = params[8]
-    phi0 = params[9]
-    pred_ca, _ = generate_helix_ca_by_crick(
-        residue_num=N,
-        centroid=centroid,
-        direction=direction,
-        radius=radius,
-        omega=omega,
-        pitch_angle=pitch_angle,
-        phi0=phi0,
+def _construct_param_vector(param_dict, param_names):
+    """
+    Construct a parameter vector from the parameter dictionary based on the specified names.
+    """
+    param_vector = []
+    for name in param_names:
+        if isinstance(param_dict[name], (int, float)):
+            param_vector.append(param_dict[name])
+        else:
+            param_vector.extend(param_dict[name])
+    return np.array(param_vector)
+
+
+def _fit_helix_by_crick_residuals(params, ca_coord_obs, parse_dict, **kwargs):
+    param_kwargs = {}
+    for key, value in parse_dict.items():
+        param_kwargs[key] = params[value]
+    pred_ca, _ = generate_helix_ca_by_crick(**param_kwargs, **kwargs)
+    return (pred_ca - ca_coord_obs).flatten()
+
+
+def _optimize_helix_by_crick(
+    ca_coords_obs,
+    initial_params,
+    param_names_to_optimize,
+):
+
+    lb_params = dict(
+        centroid=(-np.inf, -np.inf, -np.inf),
+        direction=(-1.0, -1.0, -1.0),
+        radius=2.0,
+        omega=1.5,
+        pitch_angle=-np.pi,
+        phi0=-np.pi,
     )
-    return (pred_ca - ca_coords_observed).flatten()
+    ub_params = dict(
+        centroid=(np.inf, np.inf, np.inf),
+        direction=(1.0, 1.0, 1.0),
+        radius=7.0,
+        omega=2.0,
+        pitch_angle=np.pi,
+        phi0=np.pi,
+    )
+
+    p0 = _construct_param_vector(initial_params, param_names_to_optimize)
+    lb = _construct_param_vector(lb_params, param_names_to_optimize)
+    ub = _construct_param_vector(ub_params, param_names_to_optimize)
+    fixed_params = initial_params.copy()
+    for name in param_names_to_optimize:
+        fixed_params.pop(name, None)
+    parse_dict = {}
+    param_index = 0
+    for name in param_names_to_optimize:
+        if isinstance(initial_params[name], (int, float)):
+            parse_dict[name] = param_index
+            param_index += 1
+        else:
+            parse_dict[name] = slice(
+                param_index, param_index + len(initial_params[name])
+            )
+            param_index += len(initial_params[name])
+    kwargs = dict(parse_dict=parse_dict)
+    kwargs.update(fixed_params)
+
+    result = least_squares(
+        _fit_helix_by_crick_residuals,
+        p0,
+        bounds=(lb, ub),
+        args=[ca_coords_obs],
+        kwargs=kwargs,
+        method="trf",
+    )
+    if not result.success:
+        raise ValueError("Crick helix fitting failed: " + result.message)
+    params = result.x
+    optimized_params = {}
+    for name, value in parse_dict.items():
+        optimized_params[name] = params[value]
+    final_params = optimized_params.copy()
+    final_params.update(fixed_params)
+    final_params["direction"] /= np.linalg.norm(final_params["direction"])
+    return final_params, result
 
 
 def fit_helix_by_crick(
@@ -40,7 +105,7 @@ def fit_helix_by_crick(
     - initial_params: dict - Initial parameters for the helix fitting.
 
 
-    Returns:
+    Returns
     -----------------
     - params: dict - Fitted parameters of the helix.
     - rmsd
@@ -49,79 +114,38 @@ def fit_helix_by_crick(
 
     initial_params["centroid"] = np.mean(ca_coords_obs, axis=0)
     initial_params["direction"] = ca_coords_obs[-1] - ca_coords_obs[0]
-    p0 = np.array(
-        [
-            *initial_params["centroid"],
-            *initial_params["direction"] / np.linalg.norm(initial_params["direction"]),
-            initial_params["radius"],
-            initial_params["omega"],
-            initial_params["pitch_angle"],
-            initial_params["phi0"],
-        ]
-    )
-    lb_params = dict(
-        centroid=(-np.inf, -np.inf, -np.inf),
-        direction=(-1.0, -1.0, -1.0),
-        radius=0.0,
-        omega=0.0,
-        pitch_angle=-np.inf,
-        phi0=-np.pi,
-    )
-    lb = np.array(
-        [
-            *lb_params["centroid"],
-            *lb_params["direction"],
-            lb_params["radius"],
-            lb_params["omega"],
-            lb_params["pitch_angle"],
-            lb_params["phi0"],
-        ]
-    )
-    ub_params = dict(
-        centroid=(np.inf, np.inf, np.inf),
-        direction=(1.0, 1.0, 1.0),
-        radius=np.inf,
-        omega=np.inf,
-        pitch_angle=np.inf,
-        phi0=np.pi,
-    )
-    ub = np.array(
-        [
-            *ub_params["centroid"],
-            *ub_params["direction"],
-            ub_params["radius"],
-            ub_params["omega"],
-            ub_params["pitch_angle"],
-            ub_params["phi0"],
-        ]
-    )
+    initial_params["direction"] /= np.linalg.norm(initial_params["direction"])
+    initial_params["residue_num"] = ca_coords_obs.shape[0]
 
-    N = ca_coords_obs.shape[0]
-    result = least_squares(
-        _fit_helix_by_crick_residuals,
-        p0,
-        bounds=(lb, ub),
-        args=(ca_coords_obs, N),
-        method="trf",
+    # print("Optimization")
+    stage_params, result = _optimize_helix_by_crick(
+        ca_coords_obs=ca_coords_obs,
+        initial_params=initial_params,
+        param_names_to_optimize=["centroid"],
     )
-
-    if not result.success:
-        raise ValueError("Crick helix fitting failed: " + result.message)
-    params = result.x
-    centroid = params[:3]
-    direction = params[3:6]
-    direction /= np.linalg.norm(direction)
-    if direction @ initial_params["direction"] < 0:
-        direction = -direction
-    radius = params[6]
-    omega = params[7]
-    pitch_angle = params[8]
-    phi0 = params[9]
-    rmsd = np.sqrt(np.sum(result.fun**2) / N)
-    xyz, params = generate_helix_ca_by_crick(
-        N, centroid, direction, radius, omega, pitch_angle, phi0
+    # print(stage_params)
+    stage_params, result = _optimize_helix_by_crick(
+        ca_coords_obs=ca_coords_obs,
+        initial_params=initial_params,
+        param_names_to_optimize=["centroid", "direction"],
     )
+    # print(stage_params)
+    stage_params, result = _optimize_helix_by_crick(
+        ca_coords_obs=ca_coords_obs,
+        initial_params=stage_params,
+        param_names_to_optimize=[
+            "centroid",
+            "direction",
+            "radius",
+            "omega",
+            "pitch_angle",
+            "phi0",
+        ],
+    )
+    # print(stage_params)
 
+    rmsd = np.sqrt(np.sum(result.fun**2) / ca_coords_obs.shape[0])
+    xyz, params = generate_helix_ca_by_crick(**stage_params)
     return params, rmsd, xyz
 
 
@@ -129,24 +153,11 @@ def _fit_sym_cc_by_crick_residual(params, ca_coords_obs, parse_dict, **kwargs):
     params_kwargs = {}
     for key, value in parse_dict.items():
         params_kwargs[key] = params[value]
-    xyz_pred, _ = generate_cc_ca_by_crick(
+    xyz_pred, _ = generate_cc_ca_by_cccp(
         **params_kwargs,
         **kwargs,
     )
     return (xyz_pred - ca_coords_obs).flatten()
-
-
-def _construct_param_vector(param_dict, param_names):
-    """
-    Construct a parameter vector from the parameter dictionary based on the specified names.
-    """
-    param_vector = []
-    for name in param_names:
-        if isinstance(param_dict[name], (int, float)):
-            param_vector.append(param_dict[name])
-        else:
-            param_vector.extend(param_dict[name])
-    return np.array(param_vector)
 
 
 def _optimize_sym_cc_by_crick(ca_coords_obs, initial_params, param_names_to_optimize):
@@ -157,7 +168,7 @@ def _optimize_sym_cc_by_crick(ca_coords_obs, initial_params, param_names_to_opti
         r0=2.5,
         w0=-np.pi,
         phi0=-np.pi,
-        r1s=1.2,
+        r1s=2.2,
         w1s=2 * np.pi / 7,
         phi1s=-np.pi,
         pitch_angles=-np.pi,
@@ -169,7 +180,7 @@ def _optimize_sym_cc_by_crick(ca_coords_obs, initial_params, param_names_to_opti
         r0=10,
         w0=np.inf,
         phi0=np.pi,
-        r1s=4.6,
+        r1s=2.4,
         w1s=np.pi,
         phi1s=np.pi,
         pitch_angles=np.pi,
@@ -276,59 +287,62 @@ def fit_sym_cc_by_crick(
     initial_params["direction"] = np.mean(directions_with_senses, axis=0)
     initial_params["direction"] /= np.linalg.norm(initial_params["direction"])
 
-    # Stage 1: Fit the centroid and direction of the coiled-coil
     stage_params, result = _optimize_sym_cc_by_crick(
         ca_coords_obs=ca_coords_obs,
         initial_params=initial_params,
-        param_names_to_optimize=["centroid", "direction"],
+        param_names_to_optimize=["centroid"],
     )
-    if stage_params["direction"] @ initial_params["direction"] < 0:
-        stage_params["direction"] = -stage_params["direction"]
 
     # Stage 2: Fit r0, w0, phi0 at the same time
     stage_params, result = _optimize_sym_cc_by_crick(
         ca_coords_obs=ca_coords_obs,
         initial_params=stage_params,
-        param_names_to_optimize=["centroid", "direction", "r0"],
-    )
-    stage_params, result = _optimize_sym_cc_by_crick(
-        ca_coords_obs=ca_coords_obs,
-        initial_params=stage_params,
-        param_names_to_optimize=["centroid", "direction", "r0", "w0", "phi0"],
+        param_names_to_optimize=["centroid", "r0"],
     )
 
-    # Stage 3: Fit phi1s, pitch_angles, z_offsets at the same time
     stage_params, result = _optimize_sym_cc_by_crick(
         ca_coords_obs=ca_coords_obs,
         initial_params=stage_params,
-        param_names_to_optimize=[
-            "centroid",
-            "direction",
-            "r0",
-            "w0",
-            "phi0",
-            "phi1s",
-            "z_offsets",
-        ],
+        param_names_to_optimize=["centroid", "r0", "w0", "phi0"],
     )
 
-    # Stage 4: Fit r1s and w1s at the same time
-    stage_params, result = _optimize_sym_cc_by_crick(
-        ca_coords_obs=ca_coords_obs,
-        initial_params=stage_params,
-        param_names_to_optimize=[
-            "centroid",
-            "direction",
-            "r0",
-            "w0",
-            "phi0",
-            "phi1s",
-            "z_offsets",
-            "pitch_angles",
-            "r1s",
-            "w1s",
-        ],
-    )
+    for _ in range(10):
+
+        stage_params, result = _optimize_sym_cc_by_crick(
+            ca_coords_obs=ca_coords_obs,
+            initial_params=stage_params,
+            param_names_to_optimize=[
+                "phi1s",
+                "z_offsets",
+            ],
+        )
+
+        # Stage 1: Fit the centroid and direction of the coiled-coil
+        stage_params, result = _optimize_sym_cc_by_crick(
+            ca_coords_obs=ca_coords_obs,
+            initial_params=stage_params,
+            param_names_to_optimize=["centroid", "direction"],
+        )
+        if stage_params["direction"] @ initial_params["direction"] < 0:
+            stage_params["direction"] = -stage_params["direction"]
+
+        # Stage 4: Fit r1s and w1s at the same time
+        stage_params, result = _optimize_sym_cc_by_crick(
+            ca_coords_obs=ca_coords_obs,
+            initial_params=stage_params,
+            param_names_to_optimize=[
+                "centroid",
+                "direction",
+                "r0",
+                "w0",
+                "phi0",
+                "phi1s",
+                "z_offsets",
+                "pitch_angles",
+                "r1s",
+                "w1s",
+            ],
+        )
 
     # Stage 5: 重新拟合 centroid, phi0 和 z_offsets
     stage_params["centroid"] = initial_params["centroid"]
@@ -350,5 +364,5 @@ def fit_sym_cc_by_crick(
     )
 
     rmsd = np.sqrt(np.sum(result.fun**2) / (helix_num * residue_num))
-    xyz, params = generate_cc_ca_by_crick(**stage_params)
+    xyz, params = generate_cc_ca_by_cccp(**stage_params)
     return params, rmsd, xyz

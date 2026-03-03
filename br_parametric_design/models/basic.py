@@ -1,0 +1,485 @@
+from abc import abstractmethod
+from dataclasses import dataclass, field
+from copy import deepcopy
+from pathlib import Path
+import biotite.structure as bt_struct
+from biotite.structure.io import pdb
+import numpy as np
+from scipy.spatial.transform import Rotation as R
+from ..util.alignment import calculate_rotation, calculate_euler_ZXZ
+import biorazer.structure.io as br_struct_io
+
+
+@dataclass
+class AssemblyPartProperty:
+    """
+    Properties of an AssemblyPart.
+
+    Properties
+    ----------
+    structure : bt_struct.AtomArray
+        The atomic structure of the part.
+    mask : dict[str, np.ndarray]
+        A dictionary mapping part names to boolean masks for selecting atoms in the structure.
+    """
+
+    structure: bt_struct.AtomArray = None
+    component: dict[str, "AssemblyPartParametric"] = field(default_factory=dict)
+    mask: dict[str, np.ndarray] = field(default_factory=dict)
+
+    _centroid: np.ndarray = None
+    _xyz: np.ndarray = None
+
+    @abstractmethod
+    def update_component(self):
+        """
+        Update the component dictionary based on the current structure and mask.
+        Call this method before accessing the component property.
+        """
+
+    @property
+    def centroid(self):
+        """
+        Implementation of this method should return the centroid of the structure.
+        self._centroid can be used to cache the result.
+
+        By default, the centroid is calculated using CA atoms.
+        """
+        if self._centroid is None:
+            ca_atoms = self.structure[
+                self.structure.get_annotation("atom_name") == "CA"
+            ]
+            self._centroid = bt_struct.centroid(ca_atoms)
+        return self._centroid
+
+    @property
+    @abstractmethod
+    def xyz(self):
+        """
+        Implementation of this method should return the x, y, z directions of the structure.
+        This is a placeholder method and should be implemented in subclasses.
+        self._xyz can be used to cache the result.
+
+        Returns
+        -------
+        x, y, z directions as numpy arrays.
+        """
+
+    @property
+    def coord(self):
+        coord: np.ndarray = self.structure.coord
+        return coord
+
+    @coord.setter
+    def coord(self, new_coord: np.ndarray):
+        self.structure.coord = new_coord
+
+    def __getitem__(self, mask_name: str):
+        assert (
+            mask_name in self.mask
+        ), f"Mask {mask_name} not found in {self.mask.keys()}"
+        assert self.mask[mask_name] is not None, f"Mask {mask_name} is not set"
+        return self.structure[self.mask[mask_name]]
+
+
+@dataclass
+class AssemblyPartOperation(AssemblyPartProperty):
+    """
+    Operations on an AssemblyPart.
+    """
+
+    def translate(self, x, y, z):
+        self.structure = bt_struct.translate(self.structure, [x, y, z])
+        self._centroid = None
+
+    def rotate(self, rotation: R, centroid_to_origin=True, XYZ_to_xyz=True):
+        """
+        Rotate the structure with a given rotation object around its centroid and aligned axes.
+
+        Parameters
+        -------
+        rotation : R
+            A scipy.spatial.transform.Rotation object representing the rotation to be applied.
+        centroid_to_origin : bool
+            If True, the structure is first translated to the origin before rotation and then translated back.
+        XYZ_to_xyz : bool
+            If True, the structure is first aligned with its own X, Y, Z axes to the canonical x, y, z axes before rotation and then aligned back.
+            When XYZ_to_xyz is True, centroid_to_origin will be set to True as well.
+        """
+
+        if XYZ_to_xyz:
+            centroid_to_origin = True
+
+        if centroid_to_origin:
+            center_translation = self.calculate_center_translation()
+            self.coord += center_translation
+        if XYZ_to_xyz:
+            center_rotation = self.calculate_center_rotation()
+            self.coord = center_rotation.apply(self.structure.coord)
+
+        self.coord = rotation.apply(self.structure.coord)
+
+        if XYZ_to_xyz:
+            inv_center_rotation = center_rotation.inv()
+            self.coord = inv_center_rotation.apply(self.coord)
+        if centroid_to_origin:
+            inv_center_translation = -center_translation
+            self.coord += inv_center_translation
+
+        if not centroid_to_origin:
+            self._centroid = None
+        self._xyz = None
+
+    def rotate_euler(
+        self,
+        axis_spec,
+        a,
+        b,
+        c,
+        degrees=False,
+        centroid_to_origin=True,
+        XYZ_to_xyz=True,
+    ):
+        rotation = R.from_euler(axis_spec, [a, b, c], degrees=degrees)
+        self.rotate(
+            rotation, centroid_to_origin=centroid_to_origin, XYZ_to_xyz=XYZ_to_xyz
+        )
+
+    def rotate_quat(self, x, y, z, w, centroid_to_origin=True, XYZ_to_xyz=True):
+        rotation = R.from_quat([x, y, z, w])
+        self.rotate(
+            rotation, centroid_to_origin=centroid_to_origin, XYZ_to_xyz=XYZ_to_xyz
+        )
+
+    def center(self, max_try=10):
+        """
+        Perform centering of the structure by iteratively applying rotation and translation
+        until the structure is aligned with its own X, Y, Z axes and centered at the
+
+        As long as self.center and self.xyz are properly implemented, this method should always converge.
+        """
+
+        counter = 0
+        while True:
+            # counter += 1
+            if counter > max_try:
+                raise TimeoutError(
+                    f"Failed to center the part after {max_try} attempts. "
+                    "Please check the structure and alignment."
+                )
+            rotation = self.calculate_center_rotation()
+            self.rotate(rotation, centroid_to_origin=True, XYZ_to_xyz=False)
+            translation = self.calculate_center_translation()
+            self.translate(*translation)
+            # br_struct_io.protein.PDB2PDB(
+            #     output_file=f"debug_center_{counter}.pdb"
+            # ).write(self.structure)
+
+            euler_angles = self.calculate_center_rotation().as_euler(
+                "xyz", degrees=False
+            )
+            translation = self.calculate_center_translation()
+            if np.allclose(euler_angles, [0, 0, 0], atol=1e-5) and np.allclose(
+                translation, [0, 0, 0], atol=1e-5
+            ):
+                break
+
+    def calculate_center_rotation(self):
+        """
+        Calculate the rotation that aligns the structure with its own X, Y, Z axes to the canonical x, y, z axes.
+
+        Returns
+        -------
+        A scipy.spatial.transform.Rotation object representing the rotation.
+        """
+        x, y, z = self.xyz
+        return calculate_rotation(x, y, z).inv()
+
+    def calculate_center_translation(self):
+        """
+        Calculate the translation that moves the structure to the origin.
+
+        Returns
+        -------
+        A np.ndarray that represents the translation vector.
+        """
+        centroid = self.centroid
+        return -centroid
+
+    @staticmethod
+    def calculate_transformation_between(
+        part_1: "AssemblyPart", part_2: "AssemblyPart"
+    ):
+        """
+        Calculate the transformation that aligns part_1 to part_2.
+
+        Returns
+        -------
+        translation : np.ndarray
+            A numpy array representing the translation vector.
+        rotation : R
+            A scipy.spatial.transform.Rotation object representing the rotation.
+        """
+        translation = part_2.centroid - part_1.centroid
+
+        part_1_center_rotation = part_1.calculate_center_rotation()
+        part_2_copy = deepcopy(part_2)
+        part_2_copy.rotate(
+            part_1_center_rotation, centroid_to_origin=False, XYZ_to_xyz=False
+        )
+        x, y, z = part_2_copy.xyz
+        rotation = calculate_rotation(x, y, z)
+
+        return translation, rotation
+
+    def check_axes_aligned(self, atol=1e-3):
+        """
+        Check if the structure is aligned with the X and Z axes.
+        Returns True if aligned, False otherwise.
+        """
+        x, y, z = self.xyz
+        flags = [
+            np.allclose(x, [1, 0, 0], atol=atol),
+            np.allclose(y, [0, 1, 0], atol=atol),
+            np.allclose(z, [0, 0, 1], atol=atol),
+        ]
+        if not np.all(flags):
+            raise ValueError(
+                "Structure must be aligned with X and Z axes before ZXZ rotation\n"
+                f"Current x: {x}\n"
+                f"Current y: {y}\n"
+                f"Current z: {z}"
+            )
+
+
+@dataclass
+class AssemblyPartIO(AssemblyPartProperty):
+    """
+    Input/Output operations for an AssemblyPart.
+    """
+
+    @classmethod
+    @abstractmethod
+    def from_mask(cls, structure: bt_struct.AtomArray, mask: np.ndarray):
+        """
+        Load the structure from a mask on a given structure.
+        Other properties, including mask, component, etc.,  will be generated automatically based on the structure.
+        """
+
+    @classmethod
+    @abstractmethod
+    def from_component(cls, structure: bt_struct.AtomArray, component: dict):
+        """
+        Load the structure from a component dictionary on a given structure.
+        Other properties, including mask, component, etc.,  will be generated automatically based on the structure.
+        """
+
+    def to_pdb(self, pdb_file):
+        """Export the structure to a PDB file."""
+        br_struct_io.protein.STRUCT2PDB("", pdb_file).write(self.structure)
+
+    def to_cif(self, cif_file):
+        """Export the structure to a CIF file."""
+        br_struct_io.protein.STRUCT2CIF("", cif_file).write(self.structure)
+
+
+@dataclass
+class AssemblyPart(AssemblyPartOperation, AssemblyPartIO):
+    """
+    An AssemblyPart is a part of an assembly that can contain one or more AssemblyComponents.
+    """
+
+
+@dataclass
+class AssemblyPartParametricProperty(AssemblyPart):
+    """
+    Properties of an AssemblyPart that is parametrically defined.
+
+    Properties
+    ----------
+    structure : bt_struct.AtomArray
+        The atomic structure of the part.
+    mask : dict[str, np.ndarray]
+        A dictionary mapping part names to boolean masks for selecting atoms in the structure.
+    params : dict
+        A dictionary to store parameters of the fitted model.
+    initial_param : dict
+        A dictionary to store initial parameters for fitting. You should have no other keys than those in params.
+    extra_param : dict
+        A dictionary to store extra parameters that should not be used in fitting
+    rmsd : float
+        The root mean square deviation of the fitted model.
+    fitted_coord : np.ndarray
+        The coordinates of the fitted model.
+    ref_structure : biotite.structure.AtomArray
+        Used with fit_with_ref to provide a reference structure for fitting.
+    initial_param : dict
+        A dictionary to store initial parameters for fitting.
+    """
+
+    param: dict = field(default_factory=dict)
+    initial_param: dict = field(default_factory=dict)
+    extra_param: dict = field(default_factory=dict)
+    params_not_to_fit: list[str] = field(default_factory=list)
+
+    ref_structure: bt_struct.AtomArray = None
+    fitted_structure: bt_struct.AtomArray = None
+    rmsd: float = None
+
+
+@dataclass
+class AssemblyPartParametricIO(AssemblyPartParametricProperty):
+    """
+    Input/Output operations for an AssemblyPart that is parametrically defined.
+    """
+
+
+@dataclass
+class AssemblyPartParametricOperation(AssemblyPartParametricProperty):
+    """
+    Operations on an AssemblyPart that is parametrically defined.
+    """
+
+    @abstractmethod
+    def fit(self):
+        """
+        Fit with the given coordinates and store the parameters, rmsd and fitted coordinates in the object.
+
+        self.initial_param can be used to provide initial guesses for the fitting.
+        self.params_not_to_fit can be used to specify parameters that should not be fitted.
+        """
+
+    @abstractmethod
+    def fit_with_ref(self):
+        """
+        Fit with the given coordinates to the reference structure and store the parameters, rmsd and fitted coordinates in the object.
+        - Ref is mobile, the original structure is fixed.
+        """
+
+    @abstractmethod
+    def modify(self, method, *args, **kwargs):
+        """
+        Modify the structure with the given method and arguments.
+        The method should be a string that specifies the modification method.
+        The args and kwargs are the arguments for the modification method.
+        Modification relies on the params stored in the object.
+        """
+
+
+@dataclass
+class AssemblyPartParametric(
+    AssemblyPartParametricIO,
+    AssemblyPartParametricOperation,
+):
+    """
+    An AssemblyComponent is a model that is parametrically defined and can be fitted to a set of coordinates.
+    """
+
+
+@dataclass
+class Assembly:
+
+    parts: list[AssemblyPart] = None
+
+    @staticmethod
+    def from_pdbs(part_type, pdb_file_paths, **kwargs):
+        """Load the structure from multiple PDB files."""
+        parts = []
+        for filename in pdb_file_paths:
+            part = part_type.from_pdb(filename, **kwargs)
+            parts.append(part)
+        return Assembly(parts)
+
+    @staticmethod
+    def from_pdb(part_type: AssemblyPart, pdb_file, **kwargs):
+        """Load the structure from a single PDB file. Every chain is treated as an AssemblyPart"""
+        structure = br_struct_io.protein.PDB2STRUCT(pdb_file, "").read()
+        parts = []
+        for chain in bt_struct.get_chains(structure):
+            chain_structure = structure[structure.chain_id == chain]
+            part = part_type(chain_structure, **kwargs)
+            parts.append(part)
+        return Assembly(parts)
+
+    def to_pdbs(self, output_file_stem):
+        """Export the structure to multiple PDB files"""
+        for i, part in enumerate(self.parts):
+            part.to_pdb(f"{output_file_stem}_{i}.pdb")
+
+    def merge_to_pdb(self, output_filename):
+        """Merge all parts into a single PDB file."""
+        merged_structure = bt_struct.concatenate(
+            [part.structure for part in self.parts]
+        )
+        pdb_file = pdb.PDBFile()
+        pdb.set_structure(pdb_file, merged_structure)
+        pdb_file.write(output_filename)
+
+    def append(self, new_part):
+        """Append a new part to the assembly."""
+        self.parts.append(new_part)
+
+    def __getitem__(self, index):
+        """Get a specific part by index."""
+        if isinstance(index, slice):
+            return Assembly(self.parts[index])
+        return self.parts[index]
+
+    def check_part_index(self, part_index):
+        """Check if the part index is valid."""
+        if part_index < 0 or part_index >= len(self.parts):
+            raise IndexError("Part index out of range")
+
+    def center(self, part_index):
+
+        counter = 0
+        while not np.allclose(
+            self.parts[part_index].calculate_xyz(),
+            [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+            atol=1e-4,
+        ):
+            counter += 1
+            if counter > 10:
+                raise TimeoutError(
+                    "Failed to center the part after 10 attempts. "
+                    "Please check the structure and alignment."
+                )
+            center_part: AssemblyPart = self.parts[part_index]
+            center_translation = center_part.calculate_center_translation()
+            center_rotation = center_part.calculate_center_rotation()
+            center_euler_xyz = center_rotation.as_euler("xyz", degrees=False)
+            for part in self.parts:
+                part.translate(*center_translation)
+                part.rotate_euler_xyz(*center_euler_xyz)
+
+    def calculate_rotation_between(self, part_index_1, part_index_2):
+        """
+        Calculate the rotation that aligns part_index_1 with part_index_2.
+        Returns the angles (a, b, c) in degrees.
+        """
+        self.check_part_index(part_index_1)
+        self.check_part_index(part_index_2)
+        part_1: AssemblyPart = self.parts[part_index_1]
+        part_1.check_xz_aligned()
+        part_2: AssemblyPart = self.parts[part_index_2]
+        x, y, z = part_2.calculate_xyz()
+        return calculate_rotation(x, y, z)
+
+    def calculate_ZXZ_euler_between_old(
+        self, part_index_1, part_index_2, degrees=False
+    ):
+        """
+        Calculate the ZXZ rotation that aligns part_index_1 with part_index_2.
+        Returns the angles (a, b, c) in degrees.
+        """
+        rotation = self.calculate_rotation_between(part_index_1, part_index_2)
+        euler_angles = rotation.as_euler("ZXZ", degrees=degrees)
+        return euler_angles
+
+    def calculate_quat_between(self, part_index_1, part_index_2):
+        """
+        Calculate the quaternion that aligns part_index_1 with part_index_2.
+        Returns the quaternion (x, y, z, w).
+        """
+        rotation = self.calculate_rotation_between(part_index_1, part_index_2)
+        return rotation.as_quat(scalar_first=False, canonical=True)

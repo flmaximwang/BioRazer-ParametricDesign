@@ -1,6 +1,7 @@
 import numpy as np
 from typing import Iterable
 from scipy.spatial.transform import Rotation as R
+from .geometry import crick_eq
 
 
 def generate_helix_ca_by_crick(
@@ -44,7 +45,7 @@ def generate_helix_ca_by_crick(
         x = radius * np.cos(angle)
         y = radius * np.sin(angle)
         z = radius * angle * np.tan(pitch_angle)
-        xyz[residue_i] = centroid + x * x_base + y * y_base + z * z_base
+        xyz[residue_i] = x * x_base + y * y_base + z * z_base
     xyz += centroid  # Translate back to the original centroid position
     params = dict(
         residue_num=residue_num,
@@ -70,7 +71,7 @@ def generate_cc_ca_by_crick(
     phi0: float = 0.0,  # Phase shift of the coiled bundle
     r1s: Iterable[float] | float = 2.26,  # Radius of each helix
     w1s: Iterable[float] | float = 4 * np.pi / 7,  # Frequency of each helix
-    phi1s: Iterable[float] | float = 0.0,  # Phase shift of each helix
+    phi1s: Iterable[float] | float = np.pi / 20,  # Phase shift of each helix
     pitch_angles: Iterable[float] | float = -0.2096,  # Pitch angle of each helix
     dphi0s: Iterable[float] = None,  # Separation angle between helices
     z_offsets: Iterable[float] | float = 0.0,  # Z-offsets for each helix
@@ -186,6 +187,8 @@ def generate_cc_ca_by_crick(
             )
             xyz_ii = x * x_base + y * y_base + z * z_base
             xyz[helix_i, residue_i] = xyz_ii
+    c_centroid = np.mean(xyz.reshape(-1, 3), axis=0)
+    xyz -= c_centroid  # Translate to origin
     xyz += centroid  # Translate back to the original centroid position
     params = dict(
         helix_num=helix_num,

@@ -1,6 +1,3 @@
-from .math import *
-from .geometry import *
-
 __all__ = [
     "angle_pmp",
     "angle_diff",
