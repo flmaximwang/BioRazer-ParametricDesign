@@ -143,13 +143,36 @@ class CrickHelixIO(Helix):
 @dataclass
 class CrickHelixOperation(Helix):
 
-    def fit(self):
+    def fit(self, verbose: bool = False):
+        """
+        Fit observed CA coordinates to a single Crick helix model.
+
+        Workflow
+        --------
+        1. Extract CA atoms from the masked helix structure.
+        2. Run non-linear fitting (`fit_helix_by_crick`) to obtain helix parameters.
+        3. Build a local orthonormal frame (`x`, `y`, `z`) for downstream transforms.
+        4. Store RMSD and fitted CA-only structure for diagnostics/visualization.
+        5. Infer a discrete helix type label from fitted omega.
+        """
+
+        def _log(message: str):
+            if verbose:
+                print(f"[CrickHelix.fit] {message}")
+
+        _log("Preparing CA coordinates from helix mask")
         atom_array = self["helix"]
         ca_mask = atom_array.atom_name == "CA"
         ca_atoms = atom_array[ca_mask]
         ca_coord = ca_atoms.coord
-        param, rmsd, fitted_coord = fit_helix_by_crick(ca_coord)
+
+        # Fit Crick parameters from observed CA trace.
+        _log(f"Running Crick fitting on {ca_coord.shape[0]} CA atoms")
+        param, rmsd, fitted_coord = fit_helix_by_crick(ca_coord, verbose=verbose)
         self.param = param
+
+        # Construct right-handed local axes with z as helix direction.
+        _log("Constructing local orthonormal frame")
         z = self.param["direction"]
         x_prototype = ca_atoms.coord[0] - self.param["centroid"]
         y = np.cross(z, x_prototype)
@@ -159,6 +182,8 @@ class CrickHelixOperation(Helix):
         self.extra_param["y"] = y
         self.extra_param["z"] = z
         self.rmsd = rmsd
+
+        # Keep a fitted CA-only AtomArray aligned with source chain/residue metadata.
         fitted_structure = bt_struct.AtomArray(length=ca_coord.shape[0])
         fitted_structure.atom_name = np.array(["CA"] * ca_coord.shape[0])
         fitted_structure.element = np.array(["C"] * ca_coord.shape[0])
@@ -168,6 +193,7 @@ class CrickHelixOperation(Helix):
         fitted_structure.coord = fitted_coord
         self.fitted_structure = fitted_structure
         self.extra_param["helix_type"] = self.calculate_helix_type(self.param["omega"])
+        _log(f"Completed fit, RMSD={self.rmsd:.4f}")
 
     def modify(self, method, *args, **kwargs):
         """
@@ -383,19 +409,46 @@ class CCCPHelixBundleIO(CCCPHelixBundleProperty):
 @dataclass
 class CCCPHelixBundleOperation(CCCPHelixBundleProperty):
 
-    def fit(self):
+    def fit(self, verbose: bool = False):
+        """
+        Fit a multi-helix bundle to the CCCP parameterization.
 
+        Assumptions
+        -----------
+        - Every helix in the bundle contributes CA atoms only.
+        - All helices must have identical CA length for joint fitting.
+
+        Workflow
+        --------
+        1. Validate per-helix CA lengths and set inferred initial dimensions.
+        2. Assemble observed coordinates into shape `(helix_num, residue_num, 3)`.
+        3. Run `fit_cc_by_cccp` to estimate bundle-level parameters.
+        4. Build a bundle local frame from fitted `z` and `y_prototype`.
+        5. Save fitted coordinates as a synthetic CA-only structure for inspection.
+        """
+
+        def _log(message: str):
+            if verbose:
+                print(f"[CCCPHelixBundle.fit] {message}")
+
+        _log(f"Validating CA lengths for {self.helix_num} helices")
         helix_lens = []
         for i in range(self.helix_num):
             key = f"helix_{i+1}"
             helix = self[key]
             helix_lens.append(np.sum(helix.atom_name == "CA"))
+
+        # CCCP fitting requires all helices to have the same residue count.
         assert (
             len(set(helix_lens)) == 1
         ), f"All helices must have the same length to fit a CCCP model. Current lengths: {helix_lens}"
         self.initial_param["helix_num"] = len(helix_lens)
         self.initial_param["residue_num"] = helix_lens[0]
 
+        _log(
+            f"Collecting observed CA coordinates (helix_num={self.initial_param['helix_num']}, "
+            f"residue_num={self.initial_param['residue_num']})"
+        )
         ca_coord_obs = np.zeros(
             shape=(self.initial_param["helix_num"], helix_lens[0], 3)
         )
@@ -409,13 +462,21 @@ class CCCPHelixBundleOperation(CCCPHelixBundleProperty):
             helix_component.structure = helix
             # helix_component.fit()
 
+        # Jointly fit all helices into a single CCCP bundle model.
+        _log("Running staged CCCP bundle optimization")
         param, rmsd, ca_coord_fitted = fit_cc_by_cccp(
-            ca_coord_obs, params_not_to_fit=self.params_not_to_fit, **self.initial_param
+            ca_coord_obs,
+            params_not_to_fit=self.params_not_to_fit,
+            verbose=verbose,
+            **self.initial_param,
         )
 
         self.param = param
         z = param["z"]
         y_prototype = param["y_prototype"]
+
+        # Build right-handed orthonormal basis of the fitted bundle.
+        _log("Building fitted bundle local frame")
         x = np.cross(y_prototype, z)
         x /= np.linalg.norm(x)
         y = np.cross(z, x)
@@ -430,6 +491,7 @@ class CCCPHelixBundleOperation(CCCPHelixBundleProperty):
         )
         array_length = ca_coord_fitted.shape[0]
 
+        # Materialize fitted CA coordinates as a synthetic AtomArray.
         fitted_structure = bt_struct.AtomArray(length=array_length)
         fitted_structure.res_name = np.array(["GLY"] * array_length)
         fitted_structure.element = np.array(["C"] * array_length)
@@ -447,6 +509,7 @@ class CCCPHelixBundleOperation(CCCPHelixBundleProperty):
             (self.extra_param["x"], self.extra_param["y"], self.extra_param["z"])
         )
         self._centroid = self.param["centroid"]
+        _log(f"Completed fit, RMSD={self.rmsd:.4f}")
 
 
 @dataclass

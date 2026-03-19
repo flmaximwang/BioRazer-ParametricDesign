@@ -151,38 +151,75 @@ class AssemblyPartOperation(AssemblyPartProperty):
             rotation, centroid_to_origin=centroid_to_origin, XYZ_to_xyz=XYZ_to_xyz
         )
 
-    def center(self, max_try=10):
+    def center(
+        self,
+        max_try=10,
+        atol_rot: float = 1e-5,
+        atol_trans: float = 1e-5,
+        verbose: bool = False,
+    ):
         """
         Perform centering of the structure by iteratively applying rotation and translation
-        until the structure is aligned with its own X, Y, Z axes and centered at the
+        until the structure is aligned with canonical axes and translated to origin.
+
+        Parameters
+        ----------
+        max_try : int
+            Maximum number of centering iterations.
+        atol_rot : float
+            Absolute tolerance (radian) for rotation convergence.
+        atol_trans : float
+            Absolute tolerance for translation convergence.
+        verbose : bool
+            Print per-iteration progress if True.
 
         As long as self.center and self.xyz are properly implemented, this method should always converge.
         """
 
+        def _log(message: str):
+            if verbose:
+                print(f"[AssemblyPart.center] {message}")
+
+        if max_try <= 0:
+            raise ValueError("max_try must be a positive integer")
+        if atol_rot < 0 or atol_trans < 0:
+            raise ValueError("atol_rot and atol_trans must be non-negative")
+
         counter = 0
+        _log(
+            f"Start centering with max_try={max_try}, "
+            f"atol_rot={atol_rot}, atol_trans={atol_trans}"
+        )
         while True:
-            # counter += 1
-            if counter > max_try:
-                raise TimeoutError(
-                    f"Failed to center the part after {max_try} attempts. "
-                    "Please check the structure and alignment."
-                )
+            counter += 1
             rotation = self.calculate_center_rotation()
             self.rotate(rotation, centroid_to_origin=True, XYZ_to_xyz=False)
             translation = self.calculate_center_translation()
             self.translate(*translation)
-            # br_struct_io.protein.PDB2PDB(
-            #     output_file=f"debug_center_{counter}.pdb"
-            # ).write(self.structure)
 
             euler_angles = self.calculate_center_rotation().as_euler(
                 "xyz", degrees=False
             )
             translation = self.calculate_center_translation()
-            if np.allclose(euler_angles, [0, 0, 0], atol=1e-5) and np.allclose(
-                translation, [0, 0, 0], atol=1e-5
+            _log(
+                "Iteration "
+                f"{counter}/{max_try}: "
+                f"euler(rad)={np.array2string(euler_angles, precision=4)}, "
+                f"translation={np.array2string(translation, precision=4)}"
+            )
+            if np.allclose(euler_angles, [0, 0, 0], atol=atol_rot) and np.allclose(
+                translation, [0, 0, 0], atol=atol_trans
             ):
+                _log(f"Converged in {counter} iterations")
                 break
+            if counter >= max_try:
+                raise TimeoutError(
+                    f"Failed to center the part after {max_try} attempts. "
+                    f"Thresholds: atol_rot={atol_rot}, atol_trans={atol_trans}. "
+                    f"Last euler(rad)={np.array2string(euler_angles, precision=4)}, "
+                    f"last translation={np.array2string(translation, precision=4)}. "
+                    "Please check the structure and alignment."
+                )
 
     def calculate_center_rotation(self):
         """
@@ -341,12 +378,13 @@ class AssemblyPartParametricOperation(AssemblyPartParametricProperty):
     """
 
     @abstractmethod
-    def fit(self):
+    def fit(self, verbose: bool = False):
         """
         Fit with the given coordinates and store the parameters, rmsd and fitted coordinates in the object.
 
         self.initial_param can be used to provide initial guesses for the fitting.
         self.params_not_to_fit can be used to specify parameters that should not be fitted.
+        Set verbose=True to print fitting progress information.
         """
 
     @abstractmethod
@@ -430,27 +468,70 @@ class Assembly:
         if part_index < 0 or part_index >= len(self.parts):
             raise IndexError("Part index out of range")
 
-    def center(self, part_index):
+    def center(
+        self,
+        part_index,
+        max_try=10,
+        atol_rot: float = 1e-5,
+        atol_trans: float = 1e-5,
+        verbose: bool = False,
+    ):
+        """Center one part and apply the same rigid transform to the whole assembly."""
+
+        self.check_part_index(part_index)
+        if max_try <= 0:
+            raise ValueError("max_try must be a positive integer")
+        if atol_rot < 0 or atol_trans < 0:
+            raise ValueError("atol_rot and atol_trans must be non-negative")
+
+        def _log(message: str):
+            if verbose:
+                print(f"[Assembly.center] {message}")
 
         counter = 0
-        while not np.allclose(
-            self.parts[part_index].calculate_xyz(),
-            [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
-            atol=1e-4,
-        ):
+        _log(
+            f"Start centering part[{part_index}] with max_try={max_try}, "
+            f"atol_rot={atol_rot}, atol_trans={atol_trans}"
+        )
+        while True:
             counter += 1
-            if counter > 10:
-                raise TimeoutError(
-                    "Failed to center the part after 10 attempts. "
-                    "Please check the structure and alignment."
-                )
             center_part: AssemblyPart = self.parts[part_index]
             center_translation = center_part.calculate_center_translation()
             center_rotation = center_part.calculate_center_rotation()
-            center_euler_xyz = center_rotation.as_euler("xyz", degrees=False)
+
             for part in self.parts:
                 part.translate(*center_translation)
-                part.rotate_euler_xyz(*center_euler_xyz)
+                part.rotate(
+                    center_rotation,
+                    centroid_to_origin=False,
+                    XYZ_to_xyz=False,
+                )
+
+            euler_angles = center_part.calculate_center_rotation().as_euler(
+                "xyz", degrees=False
+            )
+            translation = center_part.calculate_center_translation()
+            _log(
+                "Iteration "
+                f"{counter}/{max_try}: "
+                f"euler(rad)={np.array2string(euler_angles, precision=4)}, "
+                f"translation={np.array2string(translation, precision=4)}"
+            )
+
+            if np.allclose(euler_angles, [0, 0, 0], atol=atol_rot) and np.allclose(
+                translation, [0, 0, 0], atol=atol_trans
+            ):
+                _log(f"Converged in {counter} iterations")
+                break
+
+            if counter >= max_try:
+                raise TimeoutError(
+                    f"Failed to center part[{part_index}] after {max_try} attempts. "
+                    f"Thresholds: atol_rot={atol_rot}, atol_trans={atol_trans}. "
+                    f"Last euler(rad)={np.array2string(euler_angles, precision=4)}, "
+                    f"last translation={np.array2string(translation, precision=4)}. "
+                    "Please check the structure and alignment."
+                )
 
     def calculate_rotation_between(self, part_index_1, part_index_2):
         """

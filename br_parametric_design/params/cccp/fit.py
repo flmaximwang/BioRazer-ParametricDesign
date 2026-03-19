@@ -202,6 +202,9 @@ def _guess_direction(ca_coords_obs, senses):
 
 
 def _exclude_params(param_names: list, params_to_exclude: list):
+    """
+    Exclude specified parameter names from the list of parameter names to optimize.
+    """
     return [name for name in param_names if name not in params_to_exclude]
 
 
@@ -229,33 +232,93 @@ def fit_cc_by_cccp(
     pitch_angles: Iterable[float] | float = -0.2096,
     z_offsets: Iterable[float] | float = 0,
     params_not_to_fit: list[str] = [],
+    verbose: bool = False,
 ):
     """
+    Fit a coiled-coil model to observed CA coordinates using CCCP parameters.
+
+    The fitting is performed by staged nonlinear optimization. If specific
+    parameters are not provided, physically reasonable initial guesses are
+    generated from the observed coordinates and simple geometric heuristics.
+
     Parameters
     ----------
     ca_coords_obs : np.ndarray
-        Observed CA coordinates with shape (helix_num, residue_num, 3).
-    initial_params : dict
-        Initial parameters for coiled-coil fitting.
+        Observed CA coordinates with shape ``(helix_num, residue_num, 3)``.
+    helix_num : int, optional
+        Number of helices. If ``None``, inferred from ``ca_coords_obs.shape[0]``.
+    residue_num : int, optional
+        Number of residues per helix. If ``None``, inferred from
+        ``ca_coords_obs.shape[1]``.
+    senses : Iterable[int], optional
+        Helix direction signs (typically ``+1`` or ``-1`` for each helix).
+        If ``None``, estimated from relative backbone directions.
+    centroid : Iterable[float], optional
+        Initial bundle centroid in Cartesian coordinates.
+        If ``None``, uses the mean of all observed CA coordinates.
+    y_prototype : Iterable[float], optional
+        Prototype vector used for local frame orientation. This argument is
+        currently overwritten by a value inferred from helix 1 centroid.
+    z : Iterable[float], optional
+        Initial bundle axis direction. If ``None``, estimated from observed
+        helix directions after accounting for ``senses``.
+    r0 : float, optional
+        Superhelical radius initial value.
+    w0 : float, optional
+        Superhelical twist rate initial value.
+    phi0 : float, default 0.0
+        Global phase offset.
+    dphi0s : float or Iterable[float], optional
+        Per-helix phase offsets relative to ``phi0``.
+        If ``None``, initialized uniformly in ``[0, 2*pi)``.
+    r1s : Iterable[float] | float, default 2.26
+        Per-helix alpha-helix radius values, or one scalar broadcast to all
+        helices.
+    w1s : Iterable[float] | float, default ``4*pi/7``
+        Per-helix alpha-helix angular frequencies, or one scalar broadcast to
+        all helices.
+    phi1s : Iterable[float] | float, default 0.0
+        Per-helix alpha-helix phases, or one scalar broadcast to all helices.
+    pitch_angles : Iterable[float] | float, default -0.2096
+        Per-helix pitch angles, or one scalar broadcast to all helices.
+    z_offsets : Iterable[float] | float, default 0
+        Per-helix axial offsets along the bundle axis, or one scalar broadcast
+        to all helices.
+    params_not_to_fit : list[str], default []
+        Parameter names to hold fixed during all optimization stages.
 
     Returns
     -------
     params : dict
-        Fitted parameters of the coiled-coil helix.
+        Final fitted CCCP parameter dictionary.
+    rmsd : float
+        Root-mean-square deviation between fitted and observed CA coordinates.
+    xyz : np.ndarray
+        Generated fitted CA coordinates from final parameters.
     """
 
-    # Guess initial parameters if not provided
+    def _log(message: str):
+        if verbose:
+            print(f"[fit_cc_by_cccp] {message}")
+
+    # Build an initial parameter dictionary, using user-provided values when
+    # available and geometry-based guesses otherwise.
     initial_params = {}
-    # Suggested parameters for different helix numbers
-    # r0 = 2.4 + 1.24 * helix_num
-    # w0 = -14.52 / (helix_num + 1.936) (in degrees per residue)
-    # See: Probing Designability via a Generalized Model of Helical Bundle Geometry
+    # Suggested empirical trends for initial values:
+    #   r0 = 2.4 + 1.24 * helix_num
+    #   w0 = -14.52 / (helix_num + 1.936) (degree per residue form)
+    # Reference: Probing Designability via a Generalized Model of
+    # Helical Bundle Geometry.
     helix_num = helix_num if helix_num is not None else ca_coords_obs.shape[0]
     initial_params["helix_num"] = helix_num
     residue_num = residue_num if residue_num is not None else ca_coords_obs.shape[1]
     initial_params["residue_num"] = residue_num
+
+    # Infer helix propagation senses if not explicitly provided.
     senses = senses if senses is not None else _guess_senses(ca_coords_obs)
     initial_params["senses"] = senses
+
+    # Initialize global centroid and axis direction.
     centroid = (
         np.array(centroid)
         if centroid is not None
@@ -270,10 +333,12 @@ def fit_cc_by_cccp(
         )
     )
     helix_1_centroid = np.mean(ca_coords_obs[0], axis=0)
+    # Keep a prototype direction from bundle center to helix 1 center.
     y_prototype = helix_1_centroid - initial_params["centroid"]
     initial_params["y_prototype"] = y_prototype
     initial_params["z"] = z
 
+    # Initialize superhelical geometry.
     r0 = r0 if r0 is not None else 2.4 + 1.24 * initial_params["helix_num"]
     initial_params["r0"] = r0
     w0 = (
@@ -283,6 +348,9 @@ def fit_cc_by_cccp(
     )
     initial_params["w0"] = w0
     initial_params["phi0"] = phi0
+
+    # Initialize per-helix phase offsets. If omitted, distribute evenly around
+    # the superhelical circle.
     initial_params["dphi0s"] = (
         np.array(dphi0s)
         if dphi0s is not None
@@ -291,6 +359,8 @@ def fit_cc_by_cccp(
     assert (
         len(initial_params["dphi0s"]) == initial_params["helix_num"]
     ), "Length of dphi0s must match helix_num"
+
+    # Normalize scalar-or-vector inputs into per-helix vectors.
     for key, value in zip(
         ["r1s", "w1s", "phi1s", "pitch_angles", "z_offsets"],
         [r1s, w1s, phi1s, pitch_angles, z_offsets],
@@ -303,7 +373,8 @@ def fit_cc_by_cccp(
             len(initial_params[key]) == initial_params["helix_num"]
         ), f"Length of {key} must match helix_num"
 
-    # Optimize parameters step by step
+    # Stage 0: quickly place the model by optimizing only centroid.
+    _log("Stage 0/3: optimize centroid")
     params_to_optimize = ["centroid"]
     stage_params, result = _optimize_cc_by_cccp(
         ca_coords_obs=ca_coords_obs,
@@ -311,10 +382,21 @@ def fit_cc_by_cccp(
         param_names_to_optimize=_exclude_params(params_to_optimize, params_not_to_fit),
     )
 
-    for _ in range(10):
+    # Multi-stage refinement loop:
+    # 1) angular/offset alignment,
+    # 2) global superhelical terms,
+    # 3) full-parameter joint refinement.
+    for i in range(10):
 
+        _log(f"Refinement iteration {i + 1}/10")
+
+        # Wrap periodic angles to [-pi, pi] to keep equivalent solutions
+        # numerically stable across iterations.
         stage_params["phi0"] = _angle_pi_mod(stage_params["phi0"])
         stage_params["phi1s"] = _angle_pi_mod(stage_params["phi1s"])
+
+        # Re-center offsets to remove gauge freedom between centroid and
+        # z_offsets along the bundle axis.
         stage_params["centroid"] += (
             np.mean(stage_params["z_offsets"] * stage_params["senses"])
             * stage_params["z"]
@@ -323,11 +405,13 @@ def fit_cc_by_cccp(
             stage_params["z_offsets"] * stage_params["senses"]
         )
 
+        # Stage 1: update relative helical arrangement.
         params_to_optimize = [
             "dphi0s",
             "phi1s",
             "z_offsets",
         ]
+        _log("  Stage 1/3: update relative helix arrangement")
         stage_params, result = _optimize_cc_by_cccp(
             ca_coords_obs=ca_coords_obs,
             initial_params=stage_params,
@@ -336,11 +420,13 @@ def fit_cc_by_cccp(
             ),
         )
 
+        # Stage 2: update global superhelical scaffold.
         param_names_to_optimize = [
             "r0",
             "w0",
             "phi0",
         ]
+        _log("  Stage 2/3: update global superhelical scaffold")
         stage_params, result = _optimize_cc_by_cccp(
             ca_coords_obs=ca_coords_obs,
             initial_params=stage_params,
@@ -349,6 +435,7 @@ def fit_cc_by_cccp(
             ),
         )
 
+        # Stage 3: joint refinement of all major geometric parameters.
         param_names_to_optimize = [
             "centroid",
             "z",
@@ -362,6 +449,7 @@ def fit_cc_by_cccp(
             "pitch_angles",
             "z_offsets",
         ]
+        _log("  Stage 3/3: full joint refinement")
         stage_params, result = _optimize_cc_by_cccp(
             ca_coords_obs=ca_coords_obs,
             initial_params=stage_params,
@@ -370,6 +458,9 @@ def fit_cc_by_cccp(
             ),
         )
 
+    # Final RMSD computed from objective residual vector.
     rmsd = np.sqrt(np.sum(result.fun**2) / (helix_num * residue_num))
+    # Regenerate coordinates and normalized parameter dictionary from final fit.
     xyz, params = generate_cc_ca_by_cccp(**stage_params)
+    _log(f"Fit completed with RMSD={rmsd:.4f}")
     return params, rmsd, xyz

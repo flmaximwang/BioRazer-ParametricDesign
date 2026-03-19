@@ -97,6 +97,7 @@ def fit_helix_by_crick(
     omega=4 * np.pi / 7,
     pitch_angle=0.876,
     phi0=0.0,
+    verbose: bool = False,
 ):
     """
     Fit a Crick helix to the observed CA coordinates.
@@ -117,6 +118,10 @@ def fit_helix_by_crick(
         The coordinates of the fitted helix CA atoms.
     """
 
+    def _log(message: str):
+        if verbose:
+            print(f"[fit_helix_by_crick] {message}")
+
     initial_params = {}
     residue_num = residue_num if residue_num is not None else ca_coords_obs.shape[0]
     initial_params["residue_num"] = residue_num
@@ -132,19 +137,21 @@ def fit_helix_by_crick(
     initial_params["pitch_angle"] = pitch_angle
     initial_params["phi0"] = phi0
 
+    _log("Stage 0/2: optimize direction")
     stage_params, result = _optimize_helix_by_crick(
         ca_coords_obs=ca_coords_obs,
         initial_params=initial_params,
         param_names_to_optimize=["direction"],
     )
+    _log("Stage 1/2: optimize centroid")
     stage_params, result = _optimize_helix_by_crick(
         ca_coords_obs=ca_coords_obs,
-        initial_params=initial_params,
+        initial_params=stage_params,
         param_names_to_optimize=["centroid"],
     )
 
-    for _ in range(10):
-        print(_)
+    for i in range(10):
+        _log(f"Refinement iteration {i + 1}/10: local geometric terms")
         stage_params, result = _optimize_helix_by_crick(
             ca_coords_obs=ca_coords_obs,
             initial_params=stage_params,
@@ -155,8 +162,8 @@ def fit_helix_by_crick(
                 "phi0",
             ],
         )
-        print(stage_params)
 
+        _log(f"Refinement iteration {i + 1}/10: joint parameter update")
         stage_params, result = _optimize_helix_by_crick(
             ca_coords_obs=ca_coords_obs,
             initial_params=stage_params,
@@ -169,8 +176,8 @@ def fit_helix_by_crick(
                 "phi0",
             ],
         )
-        print(stage_params)
 
     rmsd = np.sqrt(np.sum(result.fun**2) / residue_num)
     xyz, params = generate_helix_ca_by_crick(**stage_params)
+    _log(f"Fit completed with RMSD={rmsd:.4f}")
     return params, rmsd, xyz
