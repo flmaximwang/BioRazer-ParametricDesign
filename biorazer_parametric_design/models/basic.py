@@ -4,6 +4,7 @@ from copy import deepcopy
 from pathlib import Path
 import biotite.structure as bt_struct
 from biotite.structure.io import pdb
+from biotite.structure.info import standardize_order
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 from ..util.alignment import calculate_rotation, calculate_euler_ZXZ
@@ -94,40 +95,84 @@ class AssemblyPartOperation(AssemblyPartProperty):
 
     def rotate(self, rotation: R, centroid_to_origin=True, XYZ_to_xyz=True):
         """
-        Rotate the structure with a given rotation object around its centroid and aligned axes.
+        Apply a rotation to the current structure.
+
+        This method supports two optional preprocessing steps:
+
+        1. Move the structure centroid to the origin.
+        2. Re-orient the structure's local principal directions
+           ``(X, Y, Z) = self.xyz`` onto the canonical Cartesian axes
+           ``(x, y, z)``.
+
+        After those optional steps, the input ``rotation`` is applied in the
+        temporary coordinate system. The method then restores the original
+        reference frame in reverse order.
+
+        In practice, this gives three common behaviors:
+
+        - ``centroid_to_origin=False, XYZ_to_xyz=False``:
+          rotate the current coordinates directly in the global frame.
+        - ``centroid_to_origin=True, XYZ_to_xyz=False``:
+          rotate around the structure centroid, but still in the current frame.
+        - ``XYZ_to_xyz=True``:
+          rotate in the structure's own local frame. In this case centering at
+          the origin is mandatory, so ``centroid_to_origin`` is implicitly
+          treated as ``True``.
 
         Parameters
-        -------
+        ----------
         rotation : R
-            A scipy.spatial.transform.Rotation object representing the rotation to be applied.
+            Rotation to apply. The rotation is interpreted in the temporary
+            frame defined by ``centroid_to_origin`` and ``XYZ_to_xyz``.
         centroid_to_origin : bool
-            If True, the structure is first translated to the origin before rotation and then translated back.
+            If True, translate the structure so that its centroid is located at
+            the origin before the rotation, then translate it back afterwards.
+            This makes the rotation happen "around the centroid" instead of
+            around the global origin.
         XYZ_to_xyz : bool
-            If True, the structure is first aligned with its own X, Y, Z axes to the canonical x, y, z axes before rotation and then aligned back.
-            When XYZ_to_xyz is True, centroid_to_origin will be set to True as well.
+            If True, first align the structure's local axes ``self.xyz`` to the
+            canonical basis before applying ``rotation``, then transform back.
+            This is useful when the caller wants to express the rotation in the
+            part's intrinsic coordinate system rather than the current global
+            coordinate system.
+
+            When this option is enabled, ``centroid_to_origin`` is forced to
+            ``True`` because axis alignment is defined around the centered
+            structure.
         """
 
         if XYZ_to_xyz:
             centroid_to_origin = True
 
         if centroid_to_origin:
+            # Move the current centroid to the origin so subsequent rotation is
+            # performed around the part center instead of the world origin.
             center_translation = self.calculate_center_translation()
             self.coord += center_translation
         if XYZ_to_xyz:
+            # Align the part-local coordinate frame (self.xyz) with the
+            # canonical xyz frame, so `rotation` can be interpreted in the
+            # part's own reference system.
             center_rotation = self.calculate_center_rotation()
             self.coord = center_rotation.apply(self.structure.coord)
 
+        # Apply the user-provided rotation in the prepared coordinate frame.
         self.coord = rotation.apply(self.structure.coord)
 
         if XYZ_to_xyz:
+            # Restore the original local-frame orientation.
             inv_center_rotation = center_rotation.inv()
             self.coord = inv_center_rotation.apply(self.coord)
         if centroid_to_origin:
+            # Restore the original centroid position.
             inv_center_translation = -center_translation
             self.coord += inv_center_translation
 
         if not centroid_to_origin:
+            # If we rotated in-place without centering, the centroid may have
+            # changed relative to the global frame and must be recomputed.
             self._centroid = None
+        # Any rotation invalidates the cached local axes.
         self._xyz = None
 
     def rotate_euler(
@@ -140,12 +185,54 @@ class AssemblyPartOperation(AssemblyPartProperty):
         centroid_to_origin=True,
         XYZ_to_xyz=True,
     ):
+        """
+        Rotate the structure using Euler angles.
+
+        This is a convenience wrapper around :meth:`rotate`. It first builds a
+        :class:`scipy.spatial.transform.Rotation` instance from Euler angles via
+        :meth:`Rotation.from_euler`, then delegates the actual coordinate
+        transformation to :meth:`rotate`.
+
+        Parameters
+        ----------
+        axis_spec : str
+            Euler rotation sequence accepted by
+            :meth:`scipy.spatial.transform.Rotation.from_euler`, such as
+            ``"xyz"``, ``"zyx"``, or ``"ZXZ"``.
+        a, b, c : float
+            The three Euler angles corresponding to ``axis_spec``.
+        degrees : bool
+            If True, interpret ``a``, ``b``, ``c`` in degrees. Otherwise they
+            are interpreted in radians.
+        centroid_to_origin : bool
+            Passed through to :meth:`rotate`.
+        XYZ_to_xyz : bool
+            Passed through to :meth:`rotate`.
+        """
         rotation = R.from_euler(axis_spec, [a, b, c], degrees=degrees)
         self.rotate(
             rotation, centroid_to_origin=centroid_to_origin, XYZ_to_xyz=XYZ_to_xyz
         )
 
     def rotate_quat(self, x, y, z, w, centroid_to_origin=True, XYZ_to_xyz=True):
+        """
+        Rotate the structure using a quaternion.
+
+        This is a convenience wrapper around :meth:`rotate`. It constructs a
+        :class:`scipy.spatial.transform.Rotation` object from the quaternion
+        components in SciPy's expected order ``[x, y, z, w]``, then applies the
+        same centering and frame-alignment logic implemented by :meth:`rotate`.
+
+        Parameters
+        ----------
+        x, y, z, w : float
+            Quaternion components in SciPy order ``[x, y, z, w]``.
+            Note that ``w`` is the scalar term.
+        centroid_to_origin : bool
+            Passed through to :meth:`rotate`.
+        XYZ_to_xyz : bool
+            Passed through to :meth:`rotate`.
+        """
         rotation = R.from_quat([x, y, z, w])
         self.rotate(
             rotation, centroid_to_origin=centroid_to_origin, XYZ_to_xyz=XYZ_to_xyz
@@ -370,6 +457,17 @@ class AssemblyPartParametricIO(AssemblyPartParametricProperty):
     Input/Output operations for an AssemblyPart that is parametrically defined.
     """
 
+    @classmethod
+    def from_structure(cls, *, structure: bt_struct.AtomArray):
+        """Load the structure from a given structure. Other properties will be generated automatically based on the structure."""
+        res_obj = cls(structure=structure)
+        return res_obj
+
+    @classmethod
+    def from_params(cls, *, params: dict, **kwargs):
+        """Load the structure from a given set of parameters. Other properties will be generated automatically based on the parameters."""
+        raise NotImplementedError("from_params method is not implemented")
+
 
 @dataclass
 class AssemblyPartParametricOperation(AssemblyPartParametricProperty):
@@ -413,45 +511,32 @@ class AssemblyPartParametric(
     An AssemblyComponent is a model that is parametrically defined and can be fitted to a set of coordinates.
     """
 
+    def to_pymol_axes(self, prefix="default", length=5.0):
+        """
+        Export the axes of all parts in the assembly to a format that can be visualized in PyMOL.
+        Returns a list of dictionaries, each containing the part index and its x, y, z axes.
+        """
+        print("This method requires Biorazer-PyMOL to visualize the axes in PyMOL.")
+        x, y, z = self.xyz
+        centroid = self.centroid
+        print(
+            f"arrow_pass {centroid[0]},{centroid[1]},{centroid[2]},{x[0]},{x[1]},{x[2]}, r_color=1, g_color=0, b_color=0, name={prefix}_x, length={length}"
+        )
+        print(
+            f"arrow_pass {centroid[0]},{centroid[1]},{centroid[2]},{y[0]},{y[1]},{y[2]}, r_color=0, g_color=1, b_color=0, name={prefix}_y, length={length}"
+        )
+        print(
+            f"arrow_pass {centroid[0]},{centroid[1]},{centroid[2]},{z[0]},{z[1]},{z[2]}, r_color=0, g_color=0, b_color=1, name={prefix}_z, length={length}"
+        )
+
+    def copy(self):
+        """Return a deep copy of the object."""
+        return deepcopy(self)
+
 
 @dataclass
-class Assembly:
-
+class AssemblyProperty:
     parts: list[AssemblyPart] = None
-
-    @staticmethod
-    def from_pdbs(part_type, pdb_file_paths, **kwargs):
-        """Load the structure from multiple PDB files."""
-        parts = []
-        for filename in pdb_file_paths:
-            part = part_type.from_pdb(filename, **kwargs)
-            parts.append(part)
-        return Assembly(parts)
-
-    @staticmethod
-    def from_pdb(part_type: AssemblyPart, pdb_file, **kwargs):
-        """Load the structure from a single PDB file. Every chain is treated as an AssemblyPart"""
-        structure = br_struct_io.protein.PDB2STRUCT(pdb_file, "").read()
-        parts = []
-        for chain in bt_struct.get_chains(structure):
-            chain_structure = structure[structure.chain_id == chain]
-            part = part_type(chain_structure, **kwargs)
-            parts.append(part)
-        return Assembly(parts)
-
-    def to_pdbs(self, output_file_stem):
-        """Export the structure to multiple PDB files"""
-        for i, part in enumerate(self.parts):
-            part.to_pdb(f"{output_file_stem}_{i}.pdb")
-
-    def merge_to_pdb(self, output_filename):
-        """Merge all parts into a single PDB file."""
-        merged_structure = bt_struct.concatenate(
-            [part.structure for part in self.parts]
-        )
-        pdb_file = pdb.PDBFile()
-        pdb.set_structure(pdb_file, merged_structure)
-        pdb_file.write(output_filename)
 
     def append(self, new_part):
         """Append a new part to the assembly."""
@@ -460,13 +545,49 @@ class Assembly:
     def __getitem__(self, index):
         """Get a specific part by index."""
         if isinstance(index, slice):
-            return Assembly(self.parts[index])
+            return type(self)(self.parts[index])
         return self.parts[index]
 
     def check_part_index(self, part_index):
         """Check if the part index is valid."""
         if part_index < 0 or part_index >= len(self.parts):
             raise IndexError("Part index out of range")
+
+
+@dataclass
+class AssemblyIO(AssemblyProperty):
+    """
+    An Assembly can be broken down into multiple parts, each represented by an AssemblyPart. Operations can be performed on the whole assembly or individual parts.
+    """
+
+    def merge_structures(self):
+        """Merge all parts into a single structure and reorder atoms for PDB export."""
+        merged_structure = bt_struct.concatenate(
+            [part.structure for part in self.parts]
+        )
+
+        residue_starts = bt_struct.get_residue_starts(
+            merged_structure, add_exclusive_stop=True
+        )
+        residue_order = np.lexsort(
+            (
+                np.arange(len(residue_starts) - 1),
+                merged_structure.res_name[residue_starts[:-1]],
+                merged_structure.ins_code[residue_starts[:-1]],
+                merged_structure.res_id[residue_starts[:-1]],
+                merged_structure.chain_id[residue_starts[:-1]],
+            )
+        )
+        residue_sorted_indices = np.concatenate(
+            [np.arange(residue_starts[i], residue_starts[i + 1]) for i in residue_order]
+        )
+        merged_structure = merged_structure[residue_sorted_indices]
+
+        atom_order = standardize_order(merged_structure)
+        return merged_structure[atom_order]
+
+
+class AssemblyOperation(AssemblyProperty):
 
     def center(
         self,
@@ -533,34 +654,80 @@ class Assembly:
                     "Please check the structure and alignment."
                 )
 
-    def calculate_rotation_between(self, part_index_1, part_index_2):
+    def calculate_rotation_between(self, part_index_1, part_index_2, atol=1e-3):
         """
         Calculate the rotation that aligns part_index_1 with part_index_2.
-        Returns the angles (a, b, c) in degrees.
+        Returns the Rotation object representing the rotation.
         """
         self.check_part_index(part_index_1)
         self.check_part_index(part_index_2)
         part_1: AssemblyPart = self.parts[part_index_1]
-        part_1.check_xz_aligned()
+        x, y, z = part_1.xyz
+        flag = (
+            np.allclose(x, [1, 0, 0], atol=atol)
+            and np.allclose(y, [0, 1, 0], atol=atol)
+            and np.allclose(z, [0, 0, 1], atol=atol)
+        )
+        if not flag:
+            raise ValueError(
+                f"Part[{part_index_1}] is not aligned with the reference axes within atol={atol}. Current axes:\n"
+                f"x={x}, y={y}, z={z}"
+            )
         part_2: AssemblyPart = self.parts[part_index_2]
-        x, y, z = part_2.calculate_xyz()
+        x, y, z = part_2.xyz
         return calculate_rotation(x, y, z)
 
-    def calculate_ZXZ_euler_between_old(
-        self, part_index_1, part_index_2, degrees=False
-    ):
-        """
-        Calculate the ZXZ rotation that aligns part_index_1 with part_index_2.
-        Returns the angles (a, b, c) in degrees.
-        """
-        rotation = self.calculate_rotation_between(part_index_1, part_index_2)
-        euler_angles = rotation.as_euler("ZXZ", degrees=degrees)
-        return euler_angles
+    # def calculate_ZXZ_euler_between_old(
+    #     self, part_index_1, part_index_2, degrees=False
+    # ):
+    #     """
+    #     Calculate the ZXZ rotation that aligns part_index_1 with part_index_2.
+    #     Returns the angles (a, b, c) in degrees.
+    #     """
+    #     rotation = self.calculate_rotation_between(part_index_1, part_index_2)
+    #     euler_angles = rotation.as_euler("ZXZ", degrees=degrees)
+    #     return euler_angles
 
-    def calculate_quat_between(self, part_index_1, part_index_2):
+    def calculate_quat_between(
+        self, part_index_1, part_index_2, atol=1e-3, scaler_first=False, canonical=True
+    ):
         """
         Calculate the quaternion that aligns part_index_1 with part_index_2.
         Returns the quaternion (x, y, z, w).
         """
-        rotation = self.calculate_rotation_between(part_index_1, part_index_2)
+        rotation = self.calculate_rotation_between(
+            part_index_1, part_index_2, atol=atol
+        )
         return rotation.as_quat(scalar_first=False, canonical=True)
+
+    def calculate_euler_between(
+        self, part_index_1, part_index_2, axis_spec, degrees=False, atol=1e-3
+    ):
+        """
+        Calculate the Euler angles that align part_index_1 with part_index_2.
+        Returns the angles (a, b, c) in degrees.
+        """
+        rotation = self.calculate_rotation_between(
+            part_index_1, part_index_2, atol=atol
+        )
+        euler_angles = rotation.as_euler(axis_spec, degrees=degrees)
+        return euler_angles
+
+    def calculate_translation_between(self, part_index_1, part_index_2):
+        """
+        Calculate the translation that aligns part_index_1 with part_index_2.
+        Returns the translation vector as a numpy array.
+        """
+        self.check_part_index(part_index_1)
+        self.check_part_index(part_index_2)
+        part_1: AssemblyPart = self.parts[part_index_1]
+        part_2: AssemblyPart = self.parts[part_index_2]
+        translation = part_2.centroid - part_1.centroid
+        return translation
+
+
+@dataclass
+class Assembly(AssemblyIO, AssemblyOperation):
+    """
+    An Assembly can be broken down into multiple parts, each represented by an AssemblyPart. Operations can be performed on the whole assembly or individual parts.
+    """

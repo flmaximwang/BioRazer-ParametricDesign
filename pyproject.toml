@@ -3,7 +3,7 @@ requires = ["poetry-core>=1.0.0"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
-name = "br-parametric-design"
+name = "biorazer-parametric-design"
 description = "A package for assembling and analyzing symmetric biological structures."
 authors = [
     "Maxim Wang <wangfanlin2022@sibcb.ac.cn>"
@@ -11,7 +11,7 @@ authors = [
 version = "0.3.0"
 readme = "README.md"
 packages = [
-    { include = "br_parametric_design" }
+    { include = "biorazer_parametric_design" }
 ]
 
 [tool.poetry.dependencies]

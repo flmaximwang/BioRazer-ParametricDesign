@@ -97,7 +97,23 @@ class CrickHelixProperty(Helix):
 
 
 @dataclass
-class CrickHelixIO(Helix):
+class CrickHelixIO(CrickHelixProperty):
+
+    @staticmethod
+    def _validate_helix_mask(mask: dict[str, np.ndarray]):
+        if "helix" not in mask:
+            raise ValueError("Mask must contain a key 'helix' for CrickHelix.")
+        if mask["helix"] is None:
+            raise ValueError("Mask for 'helix' cannot be None.")
+        return True
+
+    @classmethod
+    def from_structure(cls, *, structure, mask: dict[str, np.ndarray]):
+        res_obj = super().from_structure(structure=structure)
+        cls._validate_helix_mask(mask)
+        res_obj.mask = mask
+        return res_obj
+
     @classmethod
     def from_param(
         cls,
@@ -141,7 +157,7 @@ class CrickHelixIO(Helix):
 
 
 @dataclass
-class CrickHelixOperation(Helix):
+class CrickHelixOperation(CrickHelixProperty):
 
     def fit(self, verbose: bool = False):
         """
@@ -269,6 +285,9 @@ class CCCPHelixBundleProperty(AssemblyPartParametric):
     mask: dict[str, np.ndarray] = field(
         default_factory=lambda: {f"helix_{i+1}": None for i in range(2)}
     )
+    component: dict[str, CrickHelix] = field(
+        default_factory=lambda: {f"helix_{i+1}": CrickHelix() for i in range(2)}
+    )
     param: dict = field(
         default_factory=lambda: {
             "helix_num": None,
@@ -292,7 +311,9 @@ class CCCPHelixBundleProperty(AssemblyPartParametric):
     def update_component(self):
         for i in range(self.helix_num):
             key = f"helix_{i+1}"
-            self.component[key].structure = self.structure[self.mask[key]]
+            self.component[key] = CrickHelix.from_structure(
+                structure=self[key], mask={"helix": self.mask[key]}
+            )
 
     @property
     def centroid(self):
@@ -318,8 +339,37 @@ class CCCPHelixBundleProperty(AssemblyPartParametric):
             self.param["helix_num"] = counter
         return self.param["helix_num"]
 
+    @helix_num.setter
+    def helix_num(self, value):
+        self.param["helix_num"] = value
+
 
 class CCCPHelixBundleIO(CCCPHelixBundleProperty):
+
+    @staticmethod
+    def _validate_helix_keys(mask: dict[str, np.ndarray]):
+        helix_keys = [key for key in mask if re.match(r"helix_\d+", key)]
+        if not helix_keys:
+            raise ValueError(
+                "No valid helix keys found in mask. Expected keys like 'helix_1', 'helix_2', etc."
+            )
+        helix_nums = sorted([int(key.split("_")[1]) for key in helix_keys])
+        if helix_nums != list(range(1, max(helix_nums) + 1)):
+            raise ValueError(
+                f"Helix keys must be consecutive and start from 1. Found helix numbers: {helix_nums}"
+            )
+        return len(helix_keys)
+
+    @classmethod
+    def from_structure(
+        cls, structure: bt_struct.AtomArray, mask: dict[str, np.ndarray]
+    ):
+        res_obj = super().from_structure(structure=structure)
+        helix_num = cls._validate_helix_keys(mask)
+        res_obj.mask = mask
+        res_obj.helix_num = helix_num
+        res_obj.update_component()
+        return res_obj
 
     @classmethod
     def from_helix_num(cls, helix_num: int):
@@ -475,7 +525,15 @@ class CCCPHelixBundleOperation(CCCPHelixBundleProperty):
         z = param["z"]
         y_prototype = param["y_prototype"]
 
-        # Build right-handed orthonormal basis of the fitted bundle.
+        # Build a right-handed orthonormal frame for the fitted helix bundle.
+        # - z is the fitted bundle axis returned by CCCP.
+        # - y_prototype is an in-plane reference vector used to fix the
+        #   rotation around z; in the generator it points from the bundle
+        #   centroid toward helix_1.
+        # - x is defined as y_prototype x z, so it is perpendicular to the
+        #   bundle axis and the reference radial direction.
+        # - y is then reconstructed as z x x, yielding the final orthonormal
+        #   basis (x, y, z) used by self.xyz.
         _log("Building fitted bundle local frame")
         x = np.cross(y_prototype, z)
         x /= np.linalg.norm(x)
